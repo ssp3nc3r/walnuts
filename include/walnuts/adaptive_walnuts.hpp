@@ -1,8 +1,11 @@
 #pragma once
 
 #include <utility>
+#include <vector>
+#include <variant>
 
 #include "adam.hpp"
+#include "dual_average.hpp"
 #include "online_moments.hpp"
 #include "util.hpp"
 #include "walnuts.hpp"
@@ -50,6 +53,12 @@ struct MassAdaptConfig {
    * @param[in] iter_offset The offset from 1 of the first observation.
    * @param[in] additive_smoothing The additive smoothing of inverse mass
    * estimates.
+   * @param[in] metric_init_exponent Exponent for gradient-based metric init.
+   * Controls shrinkage toward unit metric: 0 = unit metric, 0.5 = geometric
+   * mean (nutpie default), 1 = full gradient-based. The init precision is
+   * computed as |grad|^exponent.
+   * @param[in] metric_floor Minimum value for metric diagonal entries.
+   * Prevents pathologically small values that could cause numerical issues.
    * @throw std::invalid_argument If the elements of `mass_init` are not finite
    * and positive.
    * @throw std::invalid_argument If the initial count is not finite and
@@ -57,17 +66,28 @@ struct MassAdaptConfig {
    * @throw std::invalid_argument If the iteration offset is not finite and
    * positive.
    * @throw std::invalid_argument If the additive smoothing is not in (0, 1).
+   * @throw std::invalid_argument If the metric init exponent is not in [0, 1].
+   * @throw std::invalid_argument If the metric floor is not positive.
    */
   MassAdaptConfig(const Vec<S>& mass_init, S init_count, S iter_offset,
-                  S additive_smoothing)
+                  S additive_smoothing, S metric_init_exponent = 0.5,
+                  S metric_floor = 1e-8)
       : mass_init_(mass_init),
         init_count_(init_count),
         iter_offset_(iter_offset),
-        additive_smoothing_(additive_smoothing) {
+        additive_smoothing_(additive_smoothing),
+        metric_init_exponent_(metric_init_exponent),
+        metric_floor_(metric_floor) {
     validate_positive(mass_init, "mass_init entries");
     validate_positive(init_count, "init_count");
     validate_positive(iter_offset, "iter_offset");
     validate_probability(additive_smoothing, "additive_smoothing");
+    if (metric_init_exponent < 0 || metric_init_exponent > 1) {
+      throw std::invalid_argument(
+          "metric_init_exponent must be in [0, 1], got " +
+          std::to_string(metric_init_exponent));
+    }
+    validate_positive(metric_floor, "metric_floor");
   }
 
   /** The diagonal of the diagonal initial mass matrix. */
@@ -81,6 +101,13 @@ struct MassAdaptConfig {
 
   /** The additive smoothing. */
   const S additive_smoothing_;
+
+  /** Exponent for gradient-based metric initialization.
+   * 0 = unit metric, 0.5 = geometric mean (nutpie), 1 = full gradient. */
+  const S metric_init_exponent_;
+
+  /** Minimum value for metric diagonal entries. */
+  const S metric_floor_;
 };
 
 /**
@@ -144,7 +171,69 @@ struct WalnutsConfig {
 };
 
 /**
+ * @brief Configuration for windowed adaptation (Stan-style).
+ *
+ * Windowed adaptation divides warmup into phases:
+ * 1. Initial window: fast adaptation to get in the right ballpark
+ * 2. Middle windows: doubling windows where mass matrix is reset at boundaries
+ * 3. Terminal window: final adaptation with frozen mass matrix
+ *
+ * At each window boundary, the mass matrix estimator is reset to discard
+ * potentially contaminated early samples.
+ */
+struct WindowedAdaptConfig {
+  /** Whether to use windowed adaptation (true) or continuous (false). */
+  bool enabled = false;
+
+  /** Size of initial fast adaptation window. */
+  std::size_t initial_window = 75;
+
+  /** Size of terminal window (mass matrix frozen). */
+  std::size_t terminal_window = 50;
+
+  /** Base size for doubling windows. */
+  std::size_t base_window = 25;
+
+  /**
+   * @brief Compute the window schedule for a given number of warmup iterations.
+   *
+   * @param[in] num_warmup Total warmup iterations.
+   * @return Vector of iteration numbers at which windows end (mass reset points).
+   */
+  std::vector<std::size_t> window_schedule(std::size_t num_warmup) const {
+    std::vector<std::size_t> boundaries;
+    if (!enabled || num_warmup <= initial_window + terminal_window) {
+      return boundaries;  // No windowing if warmup is too short
+    }
+
+    std::size_t middle_start = initial_window;
+    std::size_t middle_end = num_warmup - terminal_window;
+
+    // Add initial window boundary
+    boundaries.push_back(middle_start);
+
+    // Add doubling window boundaries
+    std::size_t window_size = base_window;
+    std::size_t pos = middle_start;
+    while (pos + window_size < middle_end) {
+      pos += window_size;
+      boundaries.push_back(pos);
+      window_size *= 2;
+    }
+
+    return boundaries;
+  }
+};
+
+/**
+ * @brief Enum for step size optimizer selection.
+ */
+enum class StepOptimizer { Adam, DualAveraging };
+
+/**
  * @brief The step-size adaptation handler for WALNUTS.
+ *
+ * Supports both Adam and Dual Averaging optimizers for step size adaptation.
  *
  * @tparam S The type of scalars.
  */
@@ -152,11 +241,22 @@ template <typename S>
 class StepAdaptHandler {
  public:
   /**
-   * Construct a step-size adaptation handler for WALNUTS.
+   * Construct a step-size adaptation handler using Adam.
    *
-   * @param[in] cfg The stepsize adaptation tuning parameters.
+   * @param[in] cfg The Adam stepsize adaptation tuning parameters.
    */
-  StepAdaptHandler(const AdamConfig<S>& cfg) : adam_(cfg) {}
+  StepAdaptHandler(const AdamConfig<S>& cfg)
+      : optimizer_(Adam<S>(cfg)), optimizer_type_(StepOptimizer::Adam) {}
+
+  /**
+   * Construct a step-size adaptation handler using Dual Averaging.
+   *
+   * @param[in] step_size_init Initial step size.
+   * @param[in] target_accept_rate Target acceptance rate.
+   */
+  StepAdaptHandler(S step_size_init, S target_accept_rate)
+      : optimizer_(DualAverage<S>(step_size_init, target_accept_rate)),
+        optimizer_type_(StepOptimizer::DualAveraging) {}
 
   /**
    * @brief Update with the estimate of step size given the specified
@@ -164,18 +264,34 @@ class StepAdaptHandler {
    *
    * @param[in] accept_prob The observed acceptance probability.
    */
-  void operator()(S accept_prob) { adam_.observe(accept_prob); }
+  void operator()(S accept_prob) {
+    std::visit([accept_prob](auto& opt) { opt.observe(accept_prob); },
+               optimizer_);
+  }
 
   /**
    * @brief Return the estimated step size.
    *
    * @return The estimated step size.
    */
-  S step_size() const noexcept { return adam_.step_size(); }
+  S step_size() const noexcept {
+    return std::visit([](const auto& opt) { return opt.step_size(); },
+                      optimizer_);
+  }
+
+  /**
+   * @brief Return the optimizer type being used.
+   *
+   * @return The optimizer type.
+   */
+  StepOptimizer optimizer_type() const noexcept { return optimizer_type_; }
 
  private:
-  /** The Adam instance for step size adaptation. */
-  Adam<S> adam_;
+  /** The optimizer instance (either Adam or DualAverage). */
+  std::variant<Adam<S>, DualAverage<S>> optimizer_;
+
+  /** The type of optimizer being used. */
+  StepOptimizer optimizer_type_;
 };
 
 /**
@@ -217,17 +333,32 @@ class MassEstimator {
   MassEstimator(const MassAdaptConfig<S>& mass_cfg, const Vec<S>& theta,
                 const Vec<S>& grad)
       : mass_cfg_(mass_cfg) {
-    // 0.98 is dummy that will get overwritten
-    // var_estimator_(0.98, static_cast<std::size_t>(theta.size())),
-    // inv_var_estimator_(0.98, static_cast<std::size_t>(theta.size())) {
     validate_same_size(theta, grad, "theta", "grad");
 
     S smoothing = mass_cfg_.additive_smoothing_;
+    S exponent = mass_cfg_.metric_init_exponent_;
+    S floor = mass_cfg_.metric_floor_;
     Vec<S> zero = Vec<S>::Zero(theta.size());
     Vec<S> smooth_vec = Vec<S>::Constant(theta.size(), smoothing);
-    Vec<S> sqrt_abs_grad_init = grad.array().abs().sqrt();
-    Vec<S> init_prec = (1 - smoothing) * sqrt_abs_grad_init + smooth_vec;
-    Vec<S> init_var = init_prec.array().inverse().matrix();
+    Vec<S> floor_vec = Vec<S>::Constant(theta.size(), floor);
+
+    Vec<S> init_prec;
+    Vec<S> init_var;
+
+    if (exponent < static_cast<S>(1e-10)) {
+      // Unit metric (Stan-style): all variances and precisions start at 1.0
+      init_prec = Vec<S>::Ones(theta.size());
+      init_var = Vec<S>::Ones(theta.size());
+    } else {
+      // Gradient-based initialization with tunable exponent
+      // exponent = 0.5 gives sqrt(|grad|) which is geometric mean (nutpie-style)
+      // exponent = 1.0 gives |grad| (full gradient-based)
+      // The exponent controls shrinkage toward unit metric in log-space
+      Vec<S> grad_based = grad.array().abs().pow(exponent).max(floor_vec.array());
+      init_prec = (1 - smoothing) * grad_based + smooth_vec;
+      init_var = init_prec.array().inverse().matrix();
+    }
+
     S dummy_discount = 0.98;  // gets reset before being used
     inv_var_estimator_ = OnlineMoments<S>(dummy_discount, mass_cfg.iter_offset_,
                                           zero, init_prec);
@@ -257,10 +388,52 @@ class MassEstimator {
    * @return The inverse mass matrix estimate.
    */
   Vec<S> inv_mass_estimate() const {
-    return (var_estimator_.variance().array() *
-            inv_var_estimator_.variance().array().inverse())
-        .sqrt()
-        .matrix();
+    Vec<S> inv_mass = (var_estimator_.variance().array() *
+                       inv_var_estimator_.variance().array().inverse())
+                          .sqrt()
+                          .max(mass_cfg_.metric_floor_)
+                          .matrix();
+    return inv_mass;
+  }
+
+  /**
+   * @brief Return the effective sample size of the variance estimator.
+   *
+   * This indicates how much "memory" the estimator has accumulated,
+   * accounting for exponential discounting.
+   *
+   * @return The effective sample size.
+   */
+  S effective_n() const { return var_estimator_.effective_n(); }
+
+  /**
+   * @brief Return the condition number of the current metric estimate.
+   *
+   * The condition number is max(diag) / min(diag) of the inverse mass matrix.
+   * High values indicate pathological scaling that may cause sampling issues.
+   *
+   * @return The condition number.
+   */
+  S condition_number() const {
+    Vec<S> inv_mass = inv_mass_estimate();
+    return inv_mass.maxCoeff() / inv_mass.minCoeff();
+  }
+
+  /**
+   * @brief Reset the estimator for a new adaptation window.
+   *
+   * This clears the accumulated statistics and re-initializes with unit
+   * variance, useful for windowed adaptation where the estimator needs
+   * to start fresh at window boundaries.
+   *
+   * @param[in] init_weight The initial weight for the reset estimators.
+   */
+  void reset(S init_weight = 1.0) {
+    Eigen::Index dims = var_estimator_.mean().size();
+    Vec<S> zero = Vec<S>::Zero(dims);
+    Vec<S> ones = Vec<S>::Ones(dims);
+    var_estimator_.reset(init_weight, zero, ones);
+    inv_var_estimator_.reset(init_weight, zero, ones);
   }
 
  private:
@@ -332,6 +505,24 @@ class MinMicroStepsAdaptHandler {
 };
 
 /**
+ * @brief Diagnostics collected during a warmup iteration.
+ *
+ * @tparam S The type of scalars.
+ */
+template <typename S>
+struct WarmupIterationDiagnostics {
+  std::size_t iteration = 0;
+  S step_size = 0;
+  S metric_condition_number = 0;
+  S metric_effective_n = 0;
+  std::size_t tree_depth = 0;
+  S max_energy_error = 0;
+  std::size_t divergent_count = 0;
+  std::size_t total_micro_steps = 0;
+  bool window_boundary = false;  // True if mass matrix was reset this iteration
+};
+
+/**
  * @brief The adaptive WALNUTS sampler.
  *
  * The adaptive WALNUTS sampler is configured in the constructor, then
@@ -364,7 +555,7 @@ template <class F, typename S, class RNG>
 class AdaptiveWalnuts {
  public:
   /**
-   * @brief Construct an adaptive WALNUTS sampler.
+   * @brief Construct an adaptive WALNUTS sampler with Adam step optimizer.
    *
    * The configuration objects are moved, the initialization is
    * copied, and the base random number generator and log
@@ -380,25 +571,64 @@ class AdaptiveWalnuts {
    * @param[in] logp_grad The target log density and gradient function.
    * @param[in] theta_init The initial state.
    * @param[in] mass_cfg The mass-matrix adaptation configuration.
-   * @param[in] step_cfg The step-size adaptation configuration.
+   * @param[in] step_cfg The step-size adaptation configuration (Adam).
    * @param[in] walnuts_cfg The WALNUTS configuration.
    * @param[in] target_depth The target expected NUTS tree depth.
+   * @param[in] window_cfg The windowed adaptation configuration.
+   * @param[in] num_warmup Total warmup iterations (needed for window schedule).
    */
   AdaptiveWalnuts(RNG& rng, const F& logp_grad, const Vec<S>& theta_init,
                   const MassAdaptConfig<S>& mass_cfg,
                   const AdamConfig<S>& step_cfg,
                   const WalnutsConfig<S>& walnuts_cfg,
-                  double target_depth = 4.0)
+                  double target_depth = 4.0,
+                  const WindowedAdaptConfig& window_cfg = WindowedAdaptConfig(),
+                  std::size_t num_warmup = 0)
       : mass_cfg_(mass_cfg),
-        step_cfg_(step_cfg),
         walnuts_cfg_(walnuts_cfg),
+        window_cfg_(window_cfg),
         rand_(rng),
         logp_grad_(logp_grad),
         theta_(theta_init),
         iteration_(0),
         step_adapt_handler_(step_cfg),
         mass_estimator_(mass_cfg_, theta_, grad(logp_grad, theta_)),
-        min_micro_estimator_(target_depth) {}
+        min_micro_estimator_(target_depth),
+        window_boundaries_(window_cfg_.window_schedule(num_warmup)),
+        next_window_idx_(0) {}
+
+  /**
+   * @brief Construct an adaptive WALNUTS sampler with Dual Averaging.
+   *
+   * @param[in,out] rng The base random number generator.
+   * @param[in] logp_grad The target log density and gradient function.
+   * @param[in] theta_init The initial state.
+   * @param[in] mass_cfg The mass-matrix adaptation configuration.
+   * @param[in] step_size_init Initial step size.
+   * @param[in] target_accept_rate Target acceptance rate for dual averaging.
+   * @param[in] walnuts_cfg The WALNUTS configuration.
+   * @param[in] target_depth The target expected NUTS tree depth.
+   * @param[in] window_cfg The windowed adaptation configuration.
+   * @param[in] num_warmup Total warmup iterations (needed for window schedule).
+   */
+  AdaptiveWalnuts(RNG& rng, const F& logp_grad, const Vec<S>& theta_init,
+                  const MassAdaptConfig<S>& mass_cfg, S step_size_init,
+                  S target_accept_rate, const WalnutsConfig<S>& walnuts_cfg,
+                  double target_depth = 4.0,
+                  const WindowedAdaptConfig& window_cfg = WindowedAdaptConfig(),
+                  std::size_t num_warmup = 0)
+      : mass_cfg_(mass_cfg),
+        walnuts_cfg_(walnuts_cfg),
+        window_cfg_(window_cfg),
+        rand_(rng),
+        logp_grad_(logp_grad),
+        theta_(theta_init),
+        iteration_(0),
+        step_adapt_handler_(step_size_init, target_accept_rate),
+        mass_estimator_(mass_cfg_, theta_, grad(logp_grad, theta_)),
+        min_micro_estimator_(target_depth),
+        window_boundaries_(window_cfg_.window_schedule(num_warmup)),
+        next_window_idx_(0) {}
 
   /**
    * @brief Return the next state from warmup.
@@ -412,20 +642,68 @@ class AdaptiveWalnuts {
    * @return The next warmup state.
    */
   const Vec<S> operator()() {
+    TransitionDiagnostics<S> trans_diag;
+    last_diag_ = step(trans_diag);
+    return theta_;
+  }
+
+  /**
+   * @brief Return the next state from warmup with diagnostics.
+   *
+   * @param[out] diag Diagnostics for this warmup iteration.
+   * @return The next warmup state.
+   */
+  const Vec<S> operator()(WarmupIterationDiagnostics<S>& diag) {
+    TransitionDiagnostics<S> trans_diag;
+    diag = step(trans_diag);
+    return theta_;
+  }
+
+ private:
+  /**
+   * @brief Internal step function that performs one warmup iteration.
+   */
+  WarmupIterationDiagnostics<S> step(TransitionDiagnostics<S>& trans_diag) {
     Vec<S> inv_mass = mass_estimator_.inv_mass_estimate();
     Vec<S> chol_mass = inv_mass.array().inverse().sqrt().matrix();
     Vec<S> grad_select;
     std::size_t depth = 0;
+
     theta_ = transition_w(
         rand_, logp_grad_, inv_mass, chol_mass, step_adapt_handler_.step_size(),
         walnuts_cfg_.max_nuts_depth_, walnuts_cfg_.max_step_halvings_,
         min_micro_estimator_.min_micro_steps(), walnuts_cfg_.max_error_,
-        std::move(theta_), depth, grad_select, step_adapt_handler_);
+        std::move(theta_), depth, grad_select, step_adapt_handler_, trans_diag);
+
     mass_estimator_.observe(theta_, grad_select, iteration_);
     min_micro_estimator_.observe(depth);
+
+    // Check for window boundary and reset mass estimator if needed
+    bool at_boundary = false;
+    if (next_window_idx_ < window_boundaries_.size() &&
+        iteration_ == window_boundaries_[next_window_idx_]) {
+      mass_estimator_.reset();
+      ++next_window_idx_;
+      at_boundary = true;
+    }
+
+    // Collect diagnostics
+    WarmupIterationDiagnostics<S> diag;
+    diag.iteration = iteration_;
+    diag.step_size = step_adapt_handler_.step_size();
+    diag.metric_condition_number = mass_estimator_.condition_number();
+    diag.metric_effective_n = mass_estimator_.effective_n();
+    diag.tree_depth = trans_diag.tree_depth;
+    diag.max_energy_error = trans_diag.max_energy_error;
+    diag.divergent_count = trans_diag.divergent_count;
+    diag.total_micro_steps = trans_diag.total_micro_steps;
+    diag.window_boundary = at_boundary;
+
     ++iteration_;
-    return theta_;
+    return diag;
   }
+
+ public:
 
   /**
    * @brief Return a WALNUTS sampler with the current tuning parameter
@@ -468,15 +746,49 @@ class AdaptiveWalnuts {
     return min_micro_estimator_.min_micro_steps();
   }
 
+  /**
+   * @brief Return the diagnostics from the last warmup iteration.
+   *
+   * @return The diagnostics from the last warmup iteration.
+   */
+  const WarmupIterationDiagnostics<S>& last_diagnostics() const {
+    return last_diag_;
+  }
+
+  /**
+   * @brief Return the condition number of the current metric.
+   *
+   * @return The condition number (max/min of diagonal).
+   */
+  S metric_condition_number() const {
+    return mass_estimator_.condition_number();
+  }
+
+  /**
+   * @brief Return the effective sample size of the metric estimator.
+   *
+   * @return The effective sample size.
+   */
+  S metric_effective_n() const { return mass_estimator_.effective_n(); }
+
+  /**
+   * @brief Return the step optimizer type being used.
+   *
+   * @return The optimizer type (Adam or DualAveraging).
+   */
+  StepOptimizer step_optimizer_type() const {
+    return step_adapt_handler_.optimizer_type();
+  }
+
  private:
   /** The mass adaptation configuration. */
   const MassAdaptConfig<S> mass_cfg_;
 
-  /** The step-size adaptation configuration. */
-  const AdamConfig<S> step_cfg_;
-
   /** The WALNUTS sampler configuration. */
   const WalnutsConfig<S> walnuts_cfg_;
+
+  /** The windowed adaptation configuration. */
+  const WindowedAdaptConfig window_cfg_;
 
   /** The random number generator required for NUTS. */
   Random<S, RNG> rand_;
@@ -494,11 +806,21 @@ class AdaptiveWalnuts {
    */
   StepAdaptHandler<S> step_adapt_handler_;
 
-  /** The estimat for mass matrices. */
+  /** The estimator for mass matrices. */
   MassEstimator<S> mass_estimator_;
 
   /** The estimator for the minimum number of micro steps per macro step. */
   MinMicroStepsAdaptHandler min_micro_estimator_;
+
+  /** Window boundaries for windowed adaptation (iterations at which to reset).
+   */
+  std::vector<std::size_t> window_boundaries_;
+
+  /** Index of the next window boundary to check. */
+  std::size_t next_window_idx_;
+
+  /** Diagnostics from the last warmup iteration. */
+  WarmupIterationDiagnostics<S> last_diag_;
 };
 
 }  // namespace nuts

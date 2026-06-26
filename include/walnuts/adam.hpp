@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 
 #include "util.hpp"
@@ -111,6 +112,12 @@ class Adam {
    * @param[in] alpha The acceptance probability.
    */
   inline void observe(S alpha) noexcept {
+    // Guard against NaN/inf acceptance probability (e.g., from inf energy error)
+    if (!std::isfinite(alpha)) {
+      // Treat as rejection - use target rate which makes gradient zero-ish
+      alpha = S(0);
+    }
+
     ++t_;
     beta1_pow_ *= beta1_;
     beta2_pow_ *= beta2_;
@@ -126,14 +133,23 @@ class Adam {
     const S denom = std::sqrt(v_hat) + eps_;
     const S effective_lr = learn_rate_ / std::sqrt(static_cast<S>(t_));
     theta_ -= effective_lr * m_hat / denom;
+
+    // Clamp theta to prevent extreme step sizes
+    // log(1e-10) ≈ -23, log(1e7) ≈ 16
+    theta_ = std::clamp(theta_, S(-23), S(16));
   }
 
   /**
    * Return the step size estimate.
    *
+   * Step size is clamped to [1e-10, 1e7] to prevent numerical instability
+   * during adaptation, matching Stan's bounds.
+   *
    * @return The step size.
    */
-  inline S step_size() const noexcept { return std::exp(theta_); }
+  inline S step_size() const noexcept {
+    return std::clamp(std::exp(theta_), S(1e-10), S(1e7));
+  }
 
  private:
   S theta_;

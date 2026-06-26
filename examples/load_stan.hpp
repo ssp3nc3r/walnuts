@@ -96,6 +96,7 @@ class DynamicStanModel {
         param_num_(dlsym_cast(library_, bs_param_num)),
         log_density_gradient_(dlsym_cast(library_, bs_log_density_gradient)),
         param_constrain_(dlsym_cast(library_, bs_param_constrain)),
+        param_unconstrain_(dlsym_cast(library_, bs_param_unconstrain_json)),
         param_names_(dlsym_cast(library_, bs_param_names)),
         rng_ptr_(nullptr, [](auto) {}) {
     // temporary: we probably don't want to store the RNG in the model
@@ -118,6 +119,22 @@ class DynamicStanModel {
   std::size_t unconstrained_dimensions() const {
     return static_cast<std::size_t>(param_unc_num_(model_ptr_.get()));
   }
+
+  // Unconstrain parameters from JSON string
+  template <typename Out>
+  void param_unconstrain(const std::string& json, Out&& out) const {
+    char* err = nullptr;
+    int ret = param_unconstrain_(model_ptr_.get(), json.c_str(), out.data(), &err);
+    if (ret != 0) {
+      if (err) {
+        std::string error_string(err);
+        free_error_msg_(err);
+        throw std::runtime_error("Error in param_unconstrain: " + error_string);
+      }
+      throw std::runtime_error("Failed to unconstrain parameters from JSON");
+    }
+  }
+
   std::size_t constrained_dimensions() const {
     return static_cast<std::size_t>(param_num_(model_ptr_.get(), true, true));
   }
@@ -187,6 +204,7 @@ class DynamicStanModel {
   decltype(&bs_param_num) param_num_;
   decltype(&bs_log_density_gradient) log_density_gradient_;
   decltype(&bs_param_constrain) param_constrain_;
+  decltype(&bs_param_unconstrain_json) param_unconstrain_;
   decltype(&bs_param_names) param_names_;
   std::unique_ptr<bs_rng, decltype(&bs_rng_destruct)> rng_ptr_;
 };

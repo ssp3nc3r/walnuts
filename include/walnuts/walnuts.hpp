@@ -11,6 +11,58 @@
 namespace nuts {
 
 /**
+ * @brief Diagnostics collected during a single macro step.
+ *
+ * @tparam S The type of scalars.
+ */
+template <typename S>
+struct MacroStepDiagnostics {
+  /** The absolute Hamiltonian error |H_final - H_initial|. */
+  S energy_error = 0;
+
+  /** The number of micro steps used in this macro step. */
+  std::size_t micro_steps = 0;
+
+  /** True if max_step_halvings was exhausted without achieving tolerance. */
+  bool divergent = false;
+};
+
+/**
+ * @brief Diagnostics accumulated over a full NUTS transition.
+ *
+ * @tparam S The type of scalars.
+ */
+template <typename S>
+struct TransitionDiagnostics {
+  /** Maximum energy error across all macro steps in the trajectory. */
+  S max_energy_error = 0;
+
+  /** Total micro steps across all macro steps. */
+  std::size_t total_micro_steps = 0;
+
+  /** Number of divergent macro steps (max_step_halvings exhausted). */
+  std::size_t divergent_count = 0;
+
+  /** Final tree depth. */
+  std::size_t tree_depth = 0;
+
+  /** Number of macro steps taken. */
+  std::size_t macro_step_count = 0;
+
+  /**
+   * @brief Accumulate diagnostics from a macro step.
+   */
+  void accumulate(const MacroStepDiagnostics<S>& macro_diag) {
+    max_energy_error = std::max(max_energy_error, macro_diag.energy_error);
+    total_micro_steps += macro_diag.micro_steps;
+    if (macro_diag.divergent) {
+      ++divergent_count;
+    }
+    ++macro_step_count;
+  }
+};
+
+/**
  * @brief A class for holding the minimal information in a Hamiltonian
  * trajectory required for WALNUTS.
  *
@@ -210,6 +262,8 @@ bool reversible(const F& logp_grad, const Vec<S>& inv_mass, S step,
  * @param[out] logp_next The log density of the positon and momentum after the
  * macro step.
  * @param[in,out] adapt_handler The step-size adaptation handler.
+ * @param[out] diag Diagnostics for this macro step (energy error, micro steps,
+ * divergent flag).
  * @return `true` if the Hamiltonian is conserved reversibly.
  */
 template <Direction D, typename S, typename F, class A>
@@ -217,7 +271,7 @@ bool macro_step(const F& logp_grad, const Vec<S>& inv_mass, S step,
                 std::size_t max_step_halvings, std::size_t min_micro_steps,
                 S max_error, const SpanW<S>& span, Vec<S>& theta_next,
                 Vec<S>& rho_next, Vec<S>& grad_next, S& logp_next,
-                A& adapt_handler) {
+                A& adapt_handler, MacroStepDiagnostics<S>& diag) {
   using std::fmax, std::fmin;
   constexpr bool is_forward = (D == Direction::Forward);
   const Vec<S>& theta = is_forward ? span.theta_fw_ : span.theta_bk_;
@@ -225,6 +279,7 @@ bool macro_step(const F& logp_grad, const Vec<S>& inv_mass, S step,
   const Vec<S>& grad = is_forward ? span.grad_theta_fw_ : span.grad_theta_bk_;
   S logp = is_forward ? span.logp_fw_ : span.logp_bk_;
   step = is_forward ? step : -step;
+  S energy_error = 0;
   for (std::size_t num_steps = min_micro_steps, halvings = 0;
        halvings < max_step_halvings; ++halvings, num_steps *= 2, step *= 0.5) {
     theta_next = theta;
@@ -239,15 +294,23 @@ bool macro_step(const F& logp_grad, const Vec<S>& inv_mass, S step,
       rho_next.noalias() += half_step * grad_next;
     }
     logp_next += logp_momentum(rho_next, inv_mass);
+    energy_error = std::fabs(logp - logp_next);
     if (num_steps == min_micro_steps) {
-      S min_accept = std::exp(-std::fabs(logp - logp_next));
+      S min_accept = std::exp(-energy_error);
       adapt_handler(min_accept);
     }
-    if (std::fabs(logp - logp_next) <= max_error) {
+    if (energy_error <= max_error) {
+      diag.energy_error = energy_error;
+      diag.micro_steps = num_steps;
+      diag.divergent = false;
       return reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
                         max_error, logp_next, theta_next, rho_next, grad_next);
     }
   }
+  // Exhausted all halvings without achieving tolerance
+  diag.energy_error = energy_error;
+  diag.micro_steps = min_micro_steps * (1 << (max_step_halvings - 1));
+  diag.divergent = true;
   return false;
 }
 
@@ -321,6 +384,7 @@ SpanW<S> combine(Rand& rng, SpanW<S>&& span_old, SpanW<S>&& span_new) {
  * @param[in] min_micro_steps The minimum number of micro steps per macro step.
  * @param[in] max_error The maximum error allowed in the Hamiltonian.
  * @param[in,out] adapt_handler The step-size adaptation handler.
+ * @param[in,out] trans_diag Accumulated transition diagnostics.
  * @return The span resulting from extending the specified span or
  * `std::nullopt` if that could not be done reversibly within threshold.
  */
@@ -329,16 +393,21 @@ std::optional<SpanW<S>> build_leaf(const F& logp_grad, const SpanW<S>& span,
                                    const Vec<S>& inv_mass, S step,
                                    std::size_t max_step_halvings,
                                    std::size_t min_micro_steps, S max_error,
-                                   A& adapt_handler) {
+                                   A& adapt_handler,
+                                   TransitionDiagnostics<S>& trans_diag) {
   Vec<S> theta_next;
   Vec<S> rho_next;
   Vec<S> grad_theta_next;
   S logp_theta_next;
+  MacroStepDiagnostics<S> macro_diag;
   if (!macro_step<D>(logp_grad, inv_mass, step, max_step_halvings,
                      min_micro_steps, max_error, span, theta_next, rho_next,
-                     grad_theta_next, logp_theta_next, adapt_handler)) {
+                     grad_theta_next, logp_theta_next, adapt_handler,
+                     macro_diag)) {
+    trans_diag.accumulate(macro_diag);
     return std::nullopt;
   }
+  trans_diag.accumulate(macro_diag);
   return SpanW<S>::from_initial_point(
       std::move(theta_next), std::move(rho_next), std::move(grad_theta_next),
       logp_theta_next);
@@ -363,6 +432,7 @@ std::optional<SpanW<S>> build_leaf(const F& logp_grad, const SpanW<S>& span,
  * @param[in] max_error The maximum error allowed at macro steps.
  * @param[in] last_span The span to extend.
  * @param[in,out] adapt_handler The step-size adaptation handler.
+ * @param[in,out] trans_diag Accumulated transition diagnostics.
  * @return The new span or `std::nullopt` if it could not be constructed.
  */
 template <Direction D, typename S, class F, class Rand, class A>
@@ -372,21 +442,23 @@ std::optional<SpanW<S>> build_span(Rand& rng, const F& logp_grad,
                                    std::size_t max_step_halvings,
                                    std::size_t min_micro_steps, S max_error,
                                    const SpanW<S>& last_span,
-                                   A& adapt_handler) {
+                                   A& adapt_handler,
+                                   TransitionDiagnostics<S>& trans_diag) {
   if (depth == 0) {
     return build_leaf<D>(logp_grad, last_span, inv_mass, step,
                          max_step_halvings, min_micro_steps, max_error,
-                         adapt_handler);
+                         adapt_handler, trans_diag);
   }
   auto maybe_subspan1 = build_span<D>(rng, logp_grad, inv_mass, step, depth - 1,
                                       max_step_halvings, min_micro_steps,
-                                      max_error, last_span, adapt_handler);
+                                      max_error, last_span, adapt_handler,
+                                      trans_diag);
   if (!maybe_subspan1) {
     return std::nullopt;
   }
   auto maybe_subspan2 = build_span<D>(
       rng, logp_grad, inv_mass, step, depth - 1, max_step_halvings,
-      min_micro_steps, max_error, *maybe_subspan1, adapt_handler);
+      min_micro_steps, max_error, *maybe_subspan1, adapt_handler, trans_diag);
   if (!maybe_subspan2) {
     return std::nullopt;
   }
@@ -418,6 +490,7 @@ std::optional<SpanW<S>> build_span(Rand& rng, const F& logp_grad,
  * @param[out] depth The tree depth used by the transition.
  * @param[out] theta_grad The gradient of the log density at the previous state.
  * @param[in,out] adapt_handler The step-size adaptation handler.
+ * @param[out] trans_diag Diagnostics for this transition.
  * @return The next position in the Markov chain.
  */
 template <typename S, class F, class Rand, class A>
@@ -425,7 +498,8 @@ Vec<S> transition_w(Rand& rand, const F& logp_grad, const Vec<S>& inv_mass,
                     const Vec<S>& chol_mass, S step, std::size_t max_depth,
                     std::size_t max_step_halvings, std::size_t min_micro_steps,
                     S max_error, Vec<S>&& theta, std::size_t& depth,
-                    Vec<S>& theta_grad, A& adapt_handler) {
+                    Vec<S>& theta_grad, A& adapt_handler,
+                    TransitionDiagnostics<S>& trans_diag) {
   std::size_t dims = static_cast<std::size_t>(theta.size());
   Vec<S> rho = rand.standard_normal(dims).cwiseProduct(chol_mass);
   Vec<S> grad(theta.size());
@@ -440,7 +514,7 @@ Vec<S> transition_w(Rand& rand, const F& logp_grad, const Vec<S>& inv_mass,
       constexpr Direction D = direction;
       auto maybe_next_span = build_span<D>(
           rand, logp_grad, inv_mass, step, depth - 1, max_step_halvings,
-          min_micro_steps, max_error, span_accum, adapt_handler);
+          min_micro_steps, max_error, span_accum, adapt_handler, trans_diag);
       if (!maybe_next_span) {
         return true;
       }
@@ -458,8 +532,27 @@ Vec<S> transition_w(Rand& rand, const F& logp_grad, const Vec<S>& inv_mass,
       break;
     }
   }
+  trans_diag.tree_depth = depth;
   theta_grad = span_accum.grad_select_;
   return std::move(span_accum.theta_select_);
+}
+
+/**
+ * @brief Return the next state in the Markov chain given the previous state.
+ *
+ * Overload without diagnostics for backward compatibility.
+ */
+template <typename S, class F, class Rand, class A>
+Vec<S> transition_w(Rand& rand, const F& logp_grad, const Vec<S>& inv_mass,
+                    const Vec<S>& chol_mass, S step, std::size_t max_depth,
+                    std::size_t max_step_halvings, std::size_t min_micro_steps,
+                    S max_error, Vec<S>&& theta, std::size_t& depth,
+                    Vec<S>& theta_grad, A& adapt_handler) {
+  TransitionDiagnostics<S> unused_diag;
+  return transition_w(rand, logp_grad, inv_mass, chol_mass, step, max_depth,
+                      max_step_halvings, min_micro_steps, max_error,
+                      std::move(theta), depth, theta_grad, adapt_handler,
+                      unused_diag);
 }
 
 /**

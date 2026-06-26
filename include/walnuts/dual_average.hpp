@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 
 #include "util.hpp"
@@ -97,9 +98,14 @@ class DualAverage {
   /**
    * @brief Return the current step-size estimate.
    *
+   * Step size is clamped to [1e-10, 1e7] to prevent numerical instability
+   * during adaptation, matching Stan's bounds.
+   *
    * @return The current estimate of step size.
    */
-  inline S step_size() const noexcept { return std::exp(log_est_avg_); }
+  inline S step_size() const noexcept {
+    return std::clamp(std::exp(log_est_avg_), S(1e-10), S(1e7));
+  }
 
  private:
   /**

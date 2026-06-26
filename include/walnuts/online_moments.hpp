@@ -174,6 +174,36 @@ class OnlineMoments {
     return Vec<S>::Ones(mean_.size());
   }
 
+  /**
+   * @brief Return the effective sample size (accumulated weight).
+   *
+   * @return The accumulated weight.
+   */
+  inline S effective_n() const noexcept { return weight_; }
+
+  /**
+   * @brief Reset the estimator to the specified initial state.
+   *
+   * This clears the accumulated statistics and re-initializes with the
+   * given mean and variance, useful for windowed adaptation where the
+   * estimator needs to be reset at window boundaries.
+   *
+   * @param[in] init_weight Weight (in number of draws) of initial mean
+   * and variance (positive).
+   * @param[in] init_mean Initial mean.
+   * @param[in] init_variance Initial variance.
+   * @pre init_weight > 0
+   * @pre init_mean.size() == init_variance.size()
+   */
+  inline void reset(S init_weight, const Vec<S>& init_mean,
+                    const Vec<S>& init_variance) {
+    validate_positive(init_weight, "init_weight");
+    validate_same_size(init_mean, init_variance, "init_mean", "init_variance");
+    weight_ = init_weight;
+    mean_ = init_mean;
+    sum_sq_dev_ = init_weight * init_variance;
+  }
+
  private:
   /** The discount factor applied to the weights of previous observations. */
   S discount_factor_;
